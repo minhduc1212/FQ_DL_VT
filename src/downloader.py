@@ -111,16 +111,29 @@ class NovelDownloader:
             # Launch the app
             logger.info("Executing: adb shell monkey -p com.dragon.read 1")
             subprocess.run(["adb", "shell", "monkey", "-p", "com.dragon.read", "1"], capture_output=True, timeout=5)
-            # Wait for Xposed & FQWeb to start
-            for i in range(8):
-                logger.debug(f"Waiting for app boot... ({8-i}s)")
-                self.console.print(f"[dim]Đang đợi ứng dụng khởi động lại... ({8-i}s)[/dim]")
-                time.sleep(1)
+            time.sleep(3)
             # Re-establish port forward
             logger.info("Executing: adb forward tcp:9999 tcp:9999")
             subprocess.run(["adb", "forward", "tcp:9999", "tcp:9999"], capture_output=True, timeout=5)
-            logger.info("App restarted and port forwarded successfully.")
-            self.console.print("[green]✓ Khởi động lại thành công! Tiếp tục tải truyện...[/green]")
+            
+            # Active polling loop: Chờ cho tới khi FQWeb server Online thực sự
+            logger.info("Waiting for FQWeb API server to respond online...")
+            server_online = False
+            for attempt in range(30):
+                connected, _ = self.api.check_connection()
+                if connected:
+                    server_online = True
+                    logger.info(f"Server is verified ONLINE after {attempt+1} seconds.")
+                    break
+                logger.debug(f"Server not ready (attempt {attempt+1}/30), waiting 1s...")
+                time.sleep(1)
+                
+            if server_online:
+                self.console.print("[green]✓ Khởi động lại thành công và Server đã Sẵn Sàng! Tiếp tục tải...[/green]")
+                self.consecutive_failures = 0
+            else:
+                logger.error("Server failed to come online after 30 seconds.")
+                self.console.print("[bold red]⚠️ Cảnh báo: Đã khởi động lại app nhưng Server FQWeb chưa phản hồi. Tiếp tục tiến trình...[/bold red]")
             time.sleep(1)
         except Exception as e:
             logger.error(f"Error during ADB app restart: {e}")
@@ -374,79 +387,73 @@ class NovelDownloader:
                                 self.consecutive_failures += 1
                                 logger.warning(f"Failed to download chapter idx={idx} title='{ch_info.get('catalog_title')}'. Consecutive failures: {self.consecutive_failures}")
                                 if self.consecutive_failures >= 15:
-                                    self.consecutive_failures = 0
                                     self.restart_fanqie_app()
                                 progress.update(task, description=f"[red]Lỗi: {ch_info.get('catalog_title')[:25]}")
                         except Exception as e:
                             self.consecutive_failures += 1
                             logger.error(f"Exception downloading chapter idx={idx}: {e}. Consecutive failures: {self.consecutive_failures}")
                             if self.consecutive_failures >= 15:
-                                self.consecutive_failures = 0
                                 self.restart_fanqie_app()
                             progress.update(task, description=f"[red]Lỗi: {ch_info.get('catalog_title')[:25]}")
 
-            # 4. Handle errors / retrying
+            # 4. Handle errors / retrying (Automatically go back and download error chapters)
             missing_count = self.get_missing_count(temp_dir, total_chapters)
             logger.info(f"Primary download pass completed. Missing count: {missing_count}")
             
             if missing_count > 0:
-                self.console.print(f"\n[yellow]Có {missing_count} chương tải lỗi hoặc chưa tải xong.[/yellow]")
-                retry_choice = questionary.confirm("Bạn có muốn tải lại các chương lỗi này không?", default=True).ask() if interactive else True
+                logger.info(f"Automatically retrying {missing_count} failed chapters.")
+                self.console.print(f"\n[yellow]Có {missing_count} chương tải lỗi. Tiến hành tự động tải lại các chương lỗi...[/yellow]")
                 
-                if retry_choice:
-                    logger.info("Initializing retry loop for failed chapters.")
-                    retry_limit = 2
-                    for attempt in range(retry_limit):
-                        missing_indices = [i for i in range(total_chapters) if not os.path.exists(os.path.join(temp_dir, f"{i}.json"))]
-                        if not missing_indices:
-                            logger.info("All missing chapters recovered.")
-                            break
+                retry_limit = 3  # Tăng số lần thử lại tự động lên 3 lần để đạt tỷ lệ thành công cao hơn
+                for attempt in range(retry_limit):
+                    missing_indices = [i for i in range(total_chapters) if not os.path.exists(os.path.join(temp_dir, f"{i}.json"))]
+                    if not missing_indices:
+                        logger.info("All missing chapters recovered.")
+                        break
+                    
+                    logger.info(f"Retry attempt {attempt+1}/{retry_limit}. Remaining missing: {len(missing_indices)}")
+                    self.console.print(f"[yellow]Tải lại các chương lỗi (Lần {attempt+1}/{retry_limit}, còn {len(missing_indices)} chương)...[/yellow]")
+                    
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(bar_width=30),
+                        TextColumn("{task.completed}/{task.total} chương"),
+                        console=self.console
+                    ) as retry_progress:
+                        retry_task = retry_progress.add_task("[yellow]Tải lại...", total=len(missing_indices))
                         
-                        logger.info(f"Retry attempt {attempt+1}/{retry_limit}. Remaining missing: {len(missing_indices)}")
-                        self.console.print(f"[yellow]Tải lại các chương lỗi (Lần {attempt+1}/{retry_limit}, còn {len(missing_indices)} chương)...[/yellow]")
-                        
-                        with Progress(
-                            SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            BarColumn(bar_width=30),
-                            TextColumn("{task.completed}/{task.total} chương"),
-                            console=self.console
-                        ) as retry_progress:
-                            retry_task = retry_progress.add_task("[yellow]Tải lại...", total=len(missing_indices))
+                        with ThreadPoolExecutor(max_workers=3) as retry_executor:
+                            retry_futures = {
+                                retry_executor.submit(
+                                    self.download_chapter_task, 
+                                    catalog_list[idx].get("item_id"), 
+                                    catalog_list[idx].get("catalog_title"), 
+                                    idx, 
+                                    os.path.join(temp_dir, f"{idx}.json"), 
+                                    retries + 2
+                                ): idx 
+                                for idx in missing_indices
+                            }
                             
-                            with ThreadPoolExecutor(max_workers=3) as retry_executor:
-                                retry_futures = {
-                                    retry_executor.submit(
-                                        self.download_chapter_task, 
-                                        catalog_list[idx].get("item_id"), 
-                                        catalog_list[idx].get("catalog_title"), 
-                                        idx, 
-                                        os.path.join(temp_dir, f"{idx}.json"), 
-                                        retries + 2
-                                    ): idx 
-                                    for idx in missing_indices
-                                }
-                                
-                                for r_future in as_completed(retry_futures):
-                                    try:
-                                        _, _, r_success = r_future.result()
-                                        if r_success:
-                                            self.consecutive_failures = 0
-                                            retry_progress.update(retry_task, advance=1)
-                                        else:
-                                            self.consecutive_failures += 1
-                                            logger.warning(f"Retry failed for chapter. Consecutive failures: {self.consecutive_failures}")
-                                            if self.consecutive_failures >= 15:
-                                                self.consecutive_failures = 0
-                                                self.restart_fanqie_app()
-                                            retry_progress.update(retry_task, description="[red]Vẫn lỗi...")
-                                    except Exception as e:
+                            for r_future in as_completed(retry_futures):
+                                try:
+                                    _, _, r_success = r_future.result()
+                                    if r_success:
+                                        self.consecutive_failures = 0
+                                        retry_progress.update(retry_task, advance=1)
+                                    else:
                                         self.consecutive_failures += 1
-                                        logger.error(f"Retry exception: {e}. Consecutive failures: {self.consecutive_failures}")
+                                        logger.warning(f"Retry failed for chapter. Consecutive failures: {self.consecutive_failures}")
                                         if self.consecutive_failures >= 15:
-                                            self.consecutive_failures = 0
                                             self.restart_fanqie_app()
                                         retry_progress.update(retry_task, description="[red]Vẫn lỗi...")
+                                except Exception as e:
+                                    self.consecutive_failures += 1
+                                    logger.error(f"Retry exception: {e}. Consecutive failures: {self.consecutive_failures}")
+                                    if self.consecutive_failures >= 15:
+                                        self.restart_fanqie_app()
+                                    retry_progress.update(retry_task, description="[red]Vẫn lỗi...")
 
             # 5. Finalize output compiling
             final_missing = self.get_missing_count(temp_dir, total_chapters)
