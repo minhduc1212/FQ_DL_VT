@@ -22,3 +22,4 @@ use api
     https://github.com/rabbits0209/novel-download
     https://t.me/s/OJBK2333/1571?q=%23%E7%95%AA%E8%8C%84%E5%B0%8F%E8%AF%B4
     https://github.com/POf-L/Fanqie-novel-Downloader
+

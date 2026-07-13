@@ -1,9 +1,19 @@
-import requests
+import sys
+from src.config import ConfigManager
+from src.api import FanqieAPI
+from src.downloader import NovelDownloader
+from src.ui import NovelCLI
 
-url = "http://localhost:9999/search?query=朕为夏君&page=1"
-response = requests.get(url)
-print(response.json()) # Tìm ID truyện ở trong này
+def main():
+    config = ConfigManager()
+    api_client = FanqieAPI(timeout=config.get("timeout"))
+    downloader = NovelDownloader(api_client, config)
+    cli = NovelCLI(api_client, downloader, config)
+    cli.run_main_loop()
 
-url_id = "http://localhost:9999/catalog?book_id=7484611801053678654"
-resp = requests.get(url_id)
-print(resp.json())
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nĐã thoát chương trình bằng phím tắt (Ctrl+C). Tạm biệt!")
+        sys.exit(0)
