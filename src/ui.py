@@ -1,9 +1,11 @@
 import time
 import sys
+import os
 from rich.console import Console
 from rich.panel import Panel
 from rich.align import Align
 import questionary
+from src.logger import logger
 
 class NovelCLI:
     CATEGORIES = [
@@ -17,7 +19,7 @@ class NovelCLI:
         {"name": "Trùng Sinh (重生)", "id": 36},
         {"name": "Khởi Đầu (开局)", "id": 453},
         {"name": "Phản Phái (反派)", "id": 369},
-        {"name": "Khoa Huyễn (科幻)", "id": 9},
+        {"name": "Khoa Huyện (科幻)", "id": 9},
         {"name": "Võ Hiệp (武侠)", "id": 16},
         {"name": "Tiên Hiệp (仙侠)", "id": 15},
         {"name": "Lịch Sử (历史)", "id": 11},
@@ -29,6 +31,7 @@ class NovelCLI:
         self.downloader = downloader
         self.config = config_manager
         self.console = Console()
+        logger.info("Initialized NovelCLI.")
 
     def print_banner(self):
         self.console.clear()
@@ -38,119 +41,135 @@ class NovelCLI:
 [bold cyan]║[/bold cyan]   [bold yellow]Phiên bản 1.0.0 | Kết nối thông qua FQWeb Local API[/bold yellow]                [bold cyan]║[/bold cyan]
 [bold cyan]╚══════════════════════════════════════════════════════════════════════╝[/bold cyan]
 """
-        self.console.print(Align.center(banner))
-
-    def show_detail_and_confirm(self, book):
-        self.print_banner()
-        self.console.print(Panel(
-            f"[bold yellow]Tiêu đề truyện:[/bold yellow] [bold green]{book['title']}[/bold green]\n"
-            f"[bold yellow]ID truyện:[/bold yellow] [bold cyan]{book['id']}[/bold cyan]\n"
-            f"[bold yellow]Tác giả:[/bold yellow] [bold white]{book['author']}[/bold white]\n"
-            f"[bold yellow]Điểm số:[/bold yellow] {book['score']}★\n"
-            f"[bold yellow]Phân loại:[/bold yellow] {book['category']} | {book['sub_info']}\n"
-            f"[bold yellow]Số chữ:[/bold yellow] {book['words']:,} từ\n\n"
-            f"[bold yellow]Tóm tắt truyện:[/bold yellow]\n{book['abstract']}",
-            title="[bold green]CHI TIẾT TRUYỆN[/bold green]",
-            border_style="cyan"
-        ))
-        
-        choice = questionary.confirm("Bạn có muốn tải bộ truyện này không?", default=True).ask()
-        if choice:
-            self.downloader.download_novel(book['id'])
+        self.console.print(banner)
 
     def search_menu(self, search_by="title"):
         self.print_banner()
-        prompt = "Nhập tên truyện cần tìm: " if search_by == "title" else "Nhập tên tác giả cần tìm: "
-        query = questionary.text(prompt).ask()
+        type_str = "Tên truyện" if search_by == "title" else "Tên tác giả"
+        query = questionary.text(f"Nhập {type_str} cần tìm:").ask()
         
         if not query or not query.strip():
             return
             
-        books = []
-        with self.console.status(f"[bold cyan]Đang tìm kiếm theo {('tên truyện' if search_by == 'title' else 'tác giả')}...[/bold cyan]"):
-            books = self.api.search_novels(query.strip())
-            
-        if not books:
-            self.console.print("[yellow]Không tìm thấy kết quả phù hợp nào.[/yellow]")
-            questionary.press_any_key_to_continue("Nhấn phím bất kỳ để quay lại menu...").ask()
+        query = query.strip()
+        logger.info(f"User search action: search_by={search_by}, query='{query}'")
+        
+        with self.console.status(f"[bold cyan]Đang tìm kiếm truyện theo {type_str.lower()}...[/bold cyan]"):
+            results = self.api.search_novels(query)
+
+        if not results:
+            logger.info("No search results found.")
+            self.console.print(f"[bold red]Không tìm thấy kết quả nào phù hợp với '{query}'.[/bold red]")
+            questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
+            return
+
+        # Lọc kết quả nếu tìm theo tác giả
+        filtered_results = []
+        if search_by == "author":
+            for book in results:
+                if query.lower() in book["author"].lower():
+                    filtered_results.append(book)
+            if not filtered_results:
+                logger.info("No search results match author name filters.")
+                self.console.print(f"[bold red]Tìm thấy truyện chứa từ khóa nhưng không có tác giả nào khớp hoàn toàn với '{query}'.[/bold red]")
+                questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
+                return
+            results = filtered_results
+
+        logger.info(f"Displaying {len(results)} search results.")
+        self.print_banner()
+        self.console.print(f"[bold green]KẾT QUẢ TÌM KIẾM CHO '{query}':[/bold green]\n")
+        
+        choices = []
+        for idx, book in enumerate(results):
+            info_str = f"{idx + 1}. [Tên] {book['title']} - [Tác giả] {book['author']} | [Từ] {book['words']:,} từ | [Điểm] {book['score']}★"
+            choices.append(info_str)
+        choices.append("⬅️ Quay lại Menu chính")
+
+        selection = questionary.select("Chọn truyện để xem chi tiết & tải:", choices=choices).ask()
+        
+        if selection == "⬅️ Quay lại Menu chính" or selection is None:
             return
             
-        options = []
-        for idx, b in enumerate(books):
-            opt_text = f"{idx+1}. {b['title']} - Tác giả: {b['author']} ({b['category']} | {b['score']}★ | {b['sub_info']})"
-            options.append(questionary.Choice(opt_text, value=b))
-            
-        options.append(questionary.Choice("⬅️ Quay lại Menu chính", value="back"))
+        selected_idx = int(selection.split(".")[0]) - 1
+        selected_book = results[selected_idx]
         
-        choice = questionary.select(
-            "Chọn truyện để xem chi tiết và tải xuống:",
-            choices=options,
-            use_shortcut_keys=True
-        ).ask()
-        
-        if choice != "back":
-            self.show_detail_and_confirm(choice)
+        logger.info(f"Selected book: {selected_book['title']} ({selected_book['id']})")
+        self.downloader.download_novel(selected_book["id"])
 
     def browse_discovery_menu(self):
         self.print_banner()
-        options = [questionary.Choice(cat["name"], value=cat) for cat in self.CATEGORIES]
-        options.append(questionary.Choice("⬅️ Quay lại Menu chính", value="back"))
+        self.console.print("[bold green]KHÁM PHÁ THEO THỂ LOẠI (DISCOVERY)[/bold green]\n")
         
-        cat_choice = questionary.select(
-            "Chọn thể loại để khám phá:",
-            choices=options
-        ).ask()
+        choices = [cat["name"] for cat in self.CATEGORIES]
+        choices.append("⬅️ Quay lại Menu chính")
         
-        if cat_choice == "back":
+        selection = questionary.select("Chọn thể loại truyện cần xem:", choices=choices).ask()
+        
+        if selection == "⬅️ Quay lại Menu chính" or selection is None:
             return
             
-        books = []
-        with self.console.status(f"[bold cyan]Đang tải danh sách truyện thuộc thể loại {cat_choice['name']}...[/bold cyan]"):
-            books = self.api.get_category_books(cat_choice["id"])
-            
+        selected_cat = next(cat for cat in self.CATEGORIES if cat["name"] == selection)
+        logger.info(f"User browsing category: {selected_cat['name']} (ID: {selected_cat['id']})")
+        
+        with self.console.status("[bold cyan]Đang tải danh sách truyện nổi bật...[/bold cyan]"):
+            books = self.api.get_category_books(selected_cat["id"])
+
         if not books:
-            self.console.print("[yellow]Không lấy được dữ liệu thể loại từ server (Cần bật app FQWeb).[/yellow]")
-            questionary.press_any_key_to_continue("Nhấn phím bất kỳ để quay lại...").ask()
+            logger.warning(f"Failed to fetch books for category {selected_cat['name']}.")
+            self.console.print("[bold red]Lỗi: Không lấy được danh sách truyện của thể loại này.[/bold red]")
+            questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
+            return
+
+        self.print_banner()
+        self.console.print(f"[bold green]TRUYỆN NỔI BẬT - {selected_cat['name']}:[/bold green]\n")
+        
+        book_choices = []
+        for idx, book in enumerate(books):
+            info_str = f"{idx + 1}. {book['title']} - {book['author']} | [Từ] {book['words']:,} từ | {book['score']}★"
+            book_choices.append(info_str)
+        book_choices.append("⬅️ Quay lại Menu chính")
+
+        book_sel = questionary.select("Chọn truyện để tải hoặc xem chi tiết:", choices=book_choices).ask()
+        
+        if book_sel == "⬅️ Quay lại Menu chính" or book_sel is None:
             return
             
-        book_options = []
-        for idx, b in enumerate(books):
-            opt_text = f"{idx+1}. {b['title']} - Tác giả: {b['author']} ({b['score']}★ | {b['sub_info']})"
-            book_options.append(questionary.Choice(opt_text, value=b))
-            
-        book_options.append(questionary.Choice("⬅️ Quay lại", value="back"))
+        selected_idx = int(book_sel.split(".")[0]) - 1
+        selected_book = books[selected_idx]
         
-        choice = questionary.select(
-            f"Danh sách truyện nổi bật của {cat_choice['name']}:",
-            choices=book_options
-        ).ask()
-        
-        if choice != "back":
-            self.show_detail_and_confirm(choice)
+        logger.info(f"Selected category book: {selected_book['title']} ({selected_book['id']})")
+        self.downloader.download_novel(selected_book["id"])
 
     def download_by_id_menu(self):
         self.print_banner()
+        self.console.print("[bold green]TẢI TRUYỆN BẰNG ID[/bold green]\n")
         book_id = questionary.text("Nhập ID truyện cần tải (Ví dụ: 7484611801053678654):").ask()
+        
         if book_id and book_id.strip():
-            if book_id.strip().isdigit():
-                self.downloader.download_novel(book_id.strip())
+            book_id = book_id.strip()
+            if book_id.isdigit():
+                logger.info(f"User action: download by manual ID: {book_id}")
+                self.downloader.download_novel(book_id)
             else:
-                self.console.print("[red]ID truyện phải là một dãy số nguyên.[/red]")
+                self.console.print("[bold red]Lỗi: ID truyện phải là một dãy số nguyên.[/bold red]")
                 questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
 
     def download_by_url_menu(self):
         self.print_banner()
-        url = questionary.text(
-            "Nhập Link/URL truyện Fanqie:\n"
-            "(Ví dụ: https://fanqie.com/reader/7484611801053678654 hoặc từ giao diện chia sẻ)"
-        ).ask()
+        self.console.print("[bold green]TẢI TRUYỆN BẰNG LINK / URL[/bold green]\n")
+        url = questionary.text("Dán URL trang chi tiết truyện (ví dụ link fanqie):").ask()
+        
         if url and url.strip():
-            book_id = self.api.extract_id_from_url(url.strip())
+            url = url.strip()
+            book_id = self.api.extract_id_from_url(url)
             if book_id:
+                logger.info(f"User action: download by URL={url}. Extracted ID={book_id}")
                 self.console.print(f"[green]Đã trích xuất được ID truyện:[/green] [bold cyan]{book_id}[/bold cyan]")
                 time.sleep(1)
                 self.downloader.download_novel(book_id)
             else:
+                logger.warning(f"Could not extract book ID from URL: {url}")
                 self.console.print("[bold red]Lỗi: Không tìm thấy ID truyện hợp lệ (19 chữ số) trong URL đã nhập.[/bold red]")
                 questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
 
@@ -182,7 +201,7 @@ class NovelCLI:
             
             choice = questionary.select("Chọn mục cài đặt cần thay đổi:", choices=setting_choices).ask()
             
-            if choice == "⬅️ Quay lại Menu chính":
+            if choice == "⬅️ Quay lại Menu chính" or choice is None:
                 break
             elif choice.startswith("1."):
                 val = questionary.text(
@@ -230,7 +249,32 @@ class NovelCLI:
                 if fmt:
                     self.config.set("save_format", fmt)
 
+    def view_log_file(self):
+        self.print_banner()
+        log_file = os.path.join("logs", "downloader.log")
+        logger.info("User action: viewing log file from CLI.")
+        
+        if not os.path.exists(log_file):
+            self.console.print("[yellow]Chưa có file nhật ký hoạt động nào được tạo.[/yellow]")
+            questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
+            return
+            
+        self.console.print("\n[bold cyan]🔍 30 DÒNG NHẬT KÝ HOẠT ĐỘNG GẦN NHẤT:[/bold cyan]\n")
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                last_lines = lines[-30:]
+                for line in last_lines:
+                    self.console.print(line.strip(), highlight=False)
+        except Exception as e:
+            logger.error(f"Error reading log file: {e}")
+            self.console.print(f"[bold red]Lỗi khi đọc file log: {e}[/bold red]")
+            
+        self.console.print("\n[bold cyan]----------------------------------------------------------------------[/bold cyan]\n")
+        questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
+
     def run_main_loop(self):
+        logger.info("=== Starting Main Loop ===")
         self.print_banner()
         self.console.print("[cyan]Đang kiểm tra kết nối tới server FQWeb (http://localhost:9999)...[/cyan]")
         
@@ -247,6 +291,7 @@ class NovelCLI:
                 time.sleep(1)
                 
         if not connected:
+            logger.warning("Starting CLI in OFFLINE mode (unable to connect to FQWeb server).")
             self.console.print(Panel(
                 "[bold red]❌ KHÔNG THỂ KẾT NỐI TỚI SERVER FQWEB[/bold red]\n\n"
                 "Ứng dụng yêu cầu app Fanqie Novel (có cài mô-đun Xposed FQWeb) đang chạy trên điện thoại hoặc giả lập Android.\n\n"
@@ -261,6 +306,7 @@ class NovelCLI:
             ))
             cont = questionary.confirm("Tiếp tục chạy ứng dụng?", default=True).ask()
             if not cont:
+                logger.info("Application exited because FQWeb server is offline.")
                 sys.exit(0)
         else:
             self.console.print("[bold green]✓ Đã kết nối thành công tới FQWeb Local API Server![/bold green]")
@@ -274,6 +320,7 @@ class NovelCLI:
                 "🧭 Khám phá truyện theo Thể loại (Browse Category)",
                 "🆔 Tải truyện bằng ID (Download by ID)",
                 "🔗 Tải truyện bằng URL/Link (Download by URL)",
+                "📋 Xem Nhật Ký Hoạt Động (View Log File)",
                 "⚙️ Cấu hình cài đặt (Settings)",
                 "❌ Thoát chương trình (Exit)"
             ]
@@ -284,6 +331,7 @@ class NovelCLI:
             ).ask()
             
             if choice is None or choice.startswith("❌"):
+                logger.info("User selected exit. App terminating.")
                 self.console.print("[cyan]Cảm ơn bạn đã sử dụng trình tải truyện! Tạm biệt![/cyan]")
                 sys.exit(0)
             elif choice.startswith("🔍"):
@@ -296,5 +344,7 @@ class NovelCLI:
                 self.download_by_id_menu()
             elif choice.startswith("🔗"):
                 self.download_by_url_menu()
+            elif choice.startswith("📋"):
+                self.view_log_file()
             elif choice.startswith("⚙️"):
                 self.settings_menu()

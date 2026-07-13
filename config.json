@@ -1,5 +1,5 @@
 {
-    "concurrency": 1,
+    "concurrency": 10,
     "retry_attempts": 3,
     "timeout": 10,
     "download_dir": "downloads",

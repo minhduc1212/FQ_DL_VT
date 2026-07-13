@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 import questionary
+from src.logger import logger
 
 class NovelDownloader:
     def __init__(self, api_client, config_manager):
@@ -17,6 +18,7 @@ class NovelDownloader:
         self.restarting_event = threading.Event()
         self.restarting_event.set()
         self.consecutive_failures = 0
+        logger.info("Initialized NovelDownloader.")
 
     @staticmethod
     def safe_filename(name):
@@ -55,7 +57,8 @@ class NovelDownloader:
                     data = json.load(f)
                     if "title" in data and "content" in data:
                         return data
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to load or parse temp file {temp_file}: {e}. Removing file.")
                 try:
                     os.remove(temp_file)
                 except Exception:
@@ -86,32 +89,41 @@ class NovelDownloader:
             return os.path.join(out_dir, f"{title_safe} - {author_safe}")
 
     def clean_temp_dir(self, temp_dir):
+        logger.info(f"Cleaning up temporary directory: {temp_dir}")
         try:
             for file in os.listdir(temp_dir):
                 os.remove(os.path.join(temp_dir, file))
             os.rmdir(temp_dir)
-        except Exception:
-            pass
+            logger.info("Temporary directory cleaned successfully.")
+        except Exception as e:
+            logger.error(f"Error cleaning temporary directory: {e}")
 
     def restart_fanqie_app(self):
         self.restarting_event.clear()
+        logger.warning("Triggered auto-restart: 15 consecutive download failures detected.")
         self.console.print("\n[yellow]⚠️ Phát hiện lỗi liên tiếp. Đang tự động khởi động lại ứng dụng Fanqie Novel để giải phóng RAM...[/yellow]")
         try:
             import subprocess
             # Force stop the app
+            logger.info("Executing: adb shell am force-stop com.dragon.read")
             subprocess.run(["adb", "shell", "am", "force-stop", "com.dragon.read"], capture_output=True, timeout=5)
             time.sleep(2)
             # Launch the app
+            logger.info("Executing: adb shell monkey -p com.dragon.read 1")
             subprocess.run(["adb", "shell", "monkey", "-p", "com.dragon.read", "1"], capture_output=True, timeout=5)
             # Wait for Xposed & FQWeb to start
             for i in range(8):
+                logger.debug(f"Waiting for app boot... ({8-i}s)")
                 self.console.print(f"[dim]Đang đợi ứng dụng khởi động lại... ({8-i}s)[/dim]")
                 time.sleep(1)
             # Re-establish port forward
+            logger.info("Executing: adb forward tcp:9999 tcp:9999")
             subprocess.run(["adb", "forward", "tcp:9999", "tcp:9999"], capture_output=True, timeout=5)
+            logger.info("App restarted and port forwarded successfully.")
             self.console.print("[green]✓ Khởi động lại thành công! Tiếp tục tải truyện...[/green]")
             time.sleep(1)
         except Exception as e:
+            logger.error(f"Error during ADB app restart: {e}")
             self.console.print(f"[bold red]Lỗi tự động khởi động lại ADB: {e}[/bold red]")
         finally:
             self.restarting_event.set()
@@ -120,9 +132,11 @@ class NovelDownloader:
         title_safe = self.safe_filename(title)
         author_safe = self.safe_filename(author)
         save_format = self.config.get("save_format")
+        logger.info(f"Compiling downloaded chapters into format: {save_format}")
         
         if save_format == "Một file TXT duy nhất":
             file_path = os.path.join(out_dir, f"{title_safe} - {author_safe}.txt")
+            logger.info(f"Writing single consolidated TXT file: {file_path}")
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(f"====================================================\n")
@@ -152,10 +166,13 @@ class NovelDownloader:
                             f.write(f"====================================================\n\n")
                             f.write("[Nội dung chương này chưa được tải xuống hoặc bị lỗi. Hãy chạy lại app để tải tiếp.]\n")
                         f.write("\n\n\n")
+                logger.info("Single TXT file compiled successfully.")
             except Exception as e:
+                logger.error(f"Error compiling single TXT file: {e}")
                 self.console.print(f"[bold red]Lỗi khi ghi file gộp: {e}[/bold red]")
         else:
             folder_path = os.path.join(out_dir, f"{title_safe} - {author_safe}")
+            logger.info(f"Writing separate chapter text files to folder: {folder_path}")
             if not os.path.exists(folder_path):
                 os.makedirs(folder_path)
             
@@ -180,7 +197,9 @@ class NovelDownloader:
                         else:
                             f.write(f"{ch_orig_title} (CHƯA TẢI/LỖI)\n\n")
                             f.write("[Nội dung chương này chưa được tải xuống hoặc bị lỗi. Hãy chạy lại app để tải tiếp.]")
+                logger.info("Separate chapter files written successfully.")
             except Exception as e:
+                logger.error(f"Error writing separate files: {e}")
                 self.console.print(f"[bold red]Lỗi khi ghi các file nhỏ: {e}[/bold red]")
 
     def download_chapter_task(self, item_id, catalog_title, index, temp_file, retry_count):
@@ -192,12 +211,13 @@ class NovelDownloader:
             # Stagger threads when starting
             time.sleep((index % concurrency) * 0.05)
 
-        for _ in range(retry_count):
+        logger.debug(f"Thread task started: index={index}, title='{catalog_title}'")
+        for attempt in range(retry_count):
             try:
                 content_data = self.api.get_chapter_content(item_id)
                 if content_data:
                     if isinstance(content_data, dict) and "error" in content_data:
-                        # Abort immediately if API returned a server-side RpcException (locked chapter)
+                        logger.error(f"Chapter index={index} API error response: {content_data.get('error')[:150]}")
                         return index, catalog_title, False
                     text = content_data.get("content", "")
                     title = content_data.get("title", catalog_title)
@@ -206,17 +226,23 @@ class NovelDownloader:
                         with open(temp_file, "w", encoding="utf-8") as f:
                             json.dump({"title": title, "content": text}, f, ensure_ascii=False, indent=2)
                         
+                        logger.debug(f"Chapter index={index} saved successfully. Size: {len(text)} chars.")
+                        
                         # Apply regular request delay to prevent hammering FQWeb
                         delay = self.config.get("request_delay")
                         if delay > 0:
                             time.sleep(delay)
                         return index, title, True
+                logger.warning(f"Chapter index={index} empty response (attempt {attempt+1}/{retry_count})")
                 time.sleep(0.5)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Chapter index={index} exception on attempt {attempt+1}/{retry_count}: {e}")
                 time.sleep(0.5)
+        logger.error(f"Chapter index={index} failed permanently after {retry_count} attempts.")
         return index, catalog_title, False
 
     def download_novel(self, book_id, interactive=True):
+        logger.info(f"=== Starting Download Flow for Book ID: {book_id} ===")
         info = None
         catalog_list = []
         
@@ -229,6 +255,7 @@ class NovelDownloader:
                     info = catalog_data.get("book_info", {})
 
         if not catalog_list:
+            logger.error("Download failed: empty chapter list/catalog from FQWeb.")
             self.console.print("[bold red]Lỗi: Không lấy được danh sách chương (Mục lục trống).[/bold red]")
             if interactive:
                 questionary.press_any_key_to_continue("Nhấn phím bất kỳ để tiếp tục...").ask()
@@ -243,6 +270,8 @@ class NovelDownloader:
         title_safe = self.safe_filename(title)
         author_safe = self.safe_filename(author)
         
+        logger.info(f"Book details: Title='{title}', Author='{author}', Chapters={len(catalog_list)}")
+        
         self.console.print(Panel(
             f"[bold yellow]Truyện:[/bold yellow] [bold green]{title}[/bold green]\n"
             f"[bold yellow]Tác giả:[/bold yellow] {author}\n"
@@ -255,6 +284,7 @@ class NovelDownloader:
 
         confirm = questionary.confirm("Bắt đầu tải bộ truyện này?", default=True).ask() if interactive else True
         if not confirm:
+            logger.info("Download cancelled by user.")
             return
 
         out_dir = self.config.get("download_dir")
@@ -279,11 +309,14 @@ class NovelDownloader:
         total_chapters = len(catalog_list)
         already_done = len(completed_indices)
         
+        logger.info(f"Scan complete. Already completed: {already_done}/{total_chapters}. Pending to download: {len(pending_indices)}")
+        
         if already_done > 0:
             self.console.print(f"[green]Tìm thấy tiến trình cũ: Đã tải xong {already_done}/{total_chapters} chương. Tiến hành tải tiếp...[/green]")
             time.sleep(1)
 
         if not pending_indices:
+            logger.info("All chapters already completed. Skipping download loop, compiling output...")
             self.console.print("[green]Tất cả các chương đã tải xong! Tiến hành gộp file...[/green]")
             self.compile_output(temp_dir, out_dir, title, author, abstract, catalog_list)
             self.clean_temp_dir(temp_dir)
@@ -301,6 +334,7 @@ class NovelDownloader:
         retries = self.config.get("retry_attempts")
         
         try:
+            logger.info(f"Starting ThreadPoolExecutor: Concurrency={concurrency}, Retries={retries}")
             self.console.print(f"\n[cyan]Bắt đầu tải với {concurrency} luồng đồng thời...[/cyan]")
             
             with Progress(
@@ -338,12 +372,14 @@ class NovelDownloader:
                                 progress.update(task, advance=1, description=f"[green]Đang tải: {ch_title[:25]}")
                             else:
                                 self.consecutive_failures += 1
+                                logger.warning(f"Failed to download chapter idx={idx} title='{ch_info.get('catalog_title')}'. Consecutive failures: {self.consecutive_failures}")
                                 if self.consecutive_failures >= 15:
                                     self.consecutive_failures = 0
                                     self.restart_fanqie_app()
                                 progress.update(task, description=f"[red]Lỗi: {ch_info.get('catalog_title')[:25]}")
-                        except Exception:
+                        except Exception as e:
                             self.consecutive_failures += 1
+                            logger.error(f"Exception downloading chapter idx={idx}: {e}. Consecutive failures: {self.consecutive_failures}")
                             if self.consecutive_failures >= 15:
                                 self.consecutive_failures = 0
                                 self.restart_fanqie_app()
@@ -351,18 +387,22 @@ class NovelDownloader:
 
             # 4. Handle errors / retrying
             missing_count = self.get_missing_count(temp_dir, total_chapters)
+            logger.info(f"Primary download pass completed. Missing count: {missing_count}")
             
             if missing_count > 0:
                 self.console.print(f"\n[yellow]Có {missing_count} chương tải lỗi hoặc chưa tải xong.[/yellow]")
                 retry_choice = questionary.confirm("Bạn có muốn tải lại các chương lỗi này không?", default=True).ask() if interactive else True
                 
                 if retry_choice:
+                    logger.info("Initializing retry loop for failed chapters.")
                     retry_limit = 2
                     for attempt in range(retry_limit):
                         missing_indices = [i for i in range(total_chapters) if not os.path.exists(os.path.join(temp_dir, f"{i}.json"))]
                         if not missing_indices:
+                            logger.info("All missing chapters recovered.")
                             break
                         
+                        logger.info(f"Retry attempt {attempt+1}/{retry_limit}. Remaining missing: {len(missing_indices)}")
                         self.console.print(f"[yellow]Tải lại các chương lỗi (Lần {attempt+1}/{retry_limit}, còn {len(missing_indices)} chương)...[/yellow]")
                         
                         with Progress(
@@ -395,12 +435,14 @@ class NovelDownloader:
                                             retry_progress.update(retry_task, advance=1)
                                         else:
                                             self.consecutive_failures += 1
+                                            logger.warning(f"Retry failed for chapter. Consecutive failures: {self.consecutive_failures}")
                                             if self.consecutive_failures >= 15:
                                                 self.consecutive_failures = 0
                                                 self.restart_fanqie_app()
                                             retry_progress.update(retry_task, description="[red]Vẫn lỗi...")
-                                    except Exception:
+                                    except Exception as e:
                                         self.consecutive_failures += 1
+                                        logger.error(f"Retry exception: {e}. Consecutive failures: {self.consecutive_failures}")
                                         if self.consecutive_failures >= 15:
                                             self.consecutive_failures = 0
                                             self.restart_fanqie_app()
@@ -408,12 +450,13 @@ class NovelDownloader:
 
             # 5. Finalize output compiling
             final_missing = self.get_missing_count(temp_dir, total_chapters)
+            logger.info(f"Compiling output file. Final missing count: {final_missing}")
             
             self.console.print("\n[cyan]Tiến hành gộp và lưu file truyện...[/cyan]")
             self.compile_output(temp_dir, out_dir, title, author, abstract, catalog_list)
             
             if final_missing == 0:
-                self.console.print("[green]Đã tải hoàn thành 100%! Tiến hành xóa file tạm...[/green]")
+                logger.info("Download completed successfully at 100%. Cleaning temp dir.")
                 self.clean_temp_dir(temp_dir)
                 self.console.print(Panel(
                     f"[bold green]Tải truyện hoàn tất 100%![/bold green]\n"
@@ -423,6 +466,7 @@ class NovelDownloader:
                     border_style="green"
                 ))
             else:
+                logger.warning(f"Download finished with {final_missing} missing chapters. Temp folder kept.")
                 self.console.print(Panel(
                     f"[bold yellow]Đã lưu file truyện tạm thời (còn thiếu chương).[/bold yellow]\n"
                     f"[bold yellow]Đường dẫn:[/bold yellow] [cyan]{os.path.abspath(self.get_final_path(out_dir, title, author))}[/cyan]\n"
@@ -433,14 +477,16 @@ class NovelDownloader:
                 ))
 
         except KeyboardInterrupt:
+            logger.warning("Download interrupted by user (KeyboardInterrupt). Saving partial progress...")
             self.console.print("\n[yellow]⚠️ Tiến trình tải bị tạm dừng bởi người dùng. Đang gộp và lưu các chương đã tải...[/yellow]")
             self.compile_output(temp_dir, out_dir, title, author, abstract, catalog_list)
+            completed_cnt = self.get_completed_count(temp_dir, total_chapters)
             self.console.print(Panel(
                 f"[bold yellow]Đã lưu tiến trình hiện tại vào file txt![/bold yellow]\n"
                 f"[bold yellow]Đường dẫn:[/bold yellow] [cyan]{os.path.abspath(self.get_final_path(out_dir, title, author))}[/cyan]\n"
-                f"[bold green]Số chương đã lưu:[/bold green] {self.get_completed_count(temp_dir, total_chapters)}/{total_chapters} chương.\n"
+                f"[bold green]Số chương đã lưu:[/bold green] {completed_cnt}/{total_chapters} chương.\n"
                 f"[dim]Chạy lại lệnh tải truyện này để tiếp tục tải các chương còn lại.[/dim]",
-                title="[bold yellow]ĐÀN TẠM DỪNG[/bold yellow]",
+                title="[bold yellow]ĐÃ TẠM DỪNG[/bold yellow]",
                 border_style="yellow"
             ))
             time.sleep(1)
